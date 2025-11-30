@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            Undiscord
 // @description     Delete all messages in a Discord channel or DM (Bulk deletion)
-// @version         5.2.5
+// @version         5.2.4b
 // @author          victornpb
 // @homepageURL     https://github.com/victornpb/undiscord
 // @supportURL      https://github.com/victornpb/undiscord/discussions
@@ -11,16 +11,16 @@
 // @license         MIT
 // @namespace       https://github.com/victornpb/deleteDiscordMessages
 // @icon            https://victornpb.github.io/undiscord/images/icon128.png
-// @downloadURL     https://raw.githubusercontent.com/victornpb/undiscord/master/deleteDiscordMessages.user.js
 // @contributionURL https://www.buymeacoffee.com/vitim
 // @grant           none
-// @attribution     Original project (https://github.com/victornpb/undiscord)
+// @downloadURL https://update.greasyfork.org/scripts/406540/Undiscord.user.js
+// @updateURL https://update.greasyfork.org/scripts/406540/Undiscord.meta.js
 // ==/UserScript==
 (function () {
 	'use strict';
 
 	/* rollup-plugin-baked-env */
-	const VERSION = "5.2.5";
+	const VERSION = "5.2.4";
 
 	var themeCss = (`
 /* undiscord window */
@@ -356,7 +356,7 @@
                     </legend>
                     <div class="multiInput">
                         <div class="input-wrapper">
-                            <input class="input" id="token" type="text" autocomplete="dont" priv>
+                            <input class="input" id="token" type="password" autocomplete="dont" priv>
                         </div>
                         <button id="getToken">fill</button>
                     </div>
@@ -482,19 +482,21 @@
 	  onProgress = undefined;
 	  onStop = undefined;
 
-	  resetState() {
-	    this.state = {
-	      running: false,
-	      delCount: 0,
-	      failCount: 0,
-	      grandTotal: 0,
-	      offset: 0,
-	      iterations: 0,
+        resetState() {
+            this.state = {
+                running: false,
+                delCount: 0,
+                failCount: 0,
+                grandTotal: 0,
+                offset: 0,
+                iterations: 0,
+                _indexNotReady: 0,
+                _threadArchived: false,
 
-	      _seachResponse: null,
-	      _messagesToDelete: [],
-	      _skippedMessages: [],
-	    };
+                _seachResponse: null,
+                _messagesToDelete: [],
+                _skippedMessages: [],
+            };
 
 	    this.options.askForConfirmation = true;
 	  }
@@ -521,6 +523,9 @@
 	      this.resetState();
 	      this.options.askForConfirmation = false;
 	      this.state.running = true; // continue running
+          const jobDelay = 3000; // 1 second between jobs
+          log.verb(`Waiting ${jobDelay}ms before next job...`);
+          await wait(jobDelay);
 	    }
 
 	    log.info('Batch finished.');
@@ -570,34 +575,59 @@
 	      this.calcEtr();
 	      log.verb(`Estimated time remaining: ${msToHMS(this.stats.etr)}`);
 
-	      // if there are messages to delete, delete them
-	      if (this.state._messagesToDelete.length > 0) {
+            // if there are messages to delete, delete them
+            if (this.state._messagesToDelete.length > 0) {
 
-	        if (await this.confirm() === false) {
-	          this.state.running = false; // break out of a job
-	          break; // immmediately stop this iteration
-	        }
+                if (await this.confirm() === false) {
+                    this.state.running = false;
+                    break;
+                }
 
-	        await this.deleteMessagesFromList();
-	      }
-	      else if (this.state._skippedMessages.length > 0) {
-	        // There are stuff, but nothing to delete (example a page full of system messages)
-	        // check next page until we see a page with nothing in it (end of results).
-	        const oldOffset = this.state.offset;
-	        this.state.offset += this.state._skippedMessages.length;
-	        log.verb('There\'s nothing we can delete on this page, checking next page...');
-	        log.verb(`Skipped ${this.state._skippedMessages.length} out of ${this.state._seachResponse.messages.length} in this page.`, `(Offset was ${oldOffset}, ajusted to ${this.state.offset})`);
-	      }
-	      else {
-	        log.verb('Ended because API returned an empty page.');
-	        log.verb('[End state]', this.state);
-	        if (isJob) break; // break without stopping if this is part of a job
-	        this.state.running = false;
-	      }
+                await this.deleteMessagesFromList();
+                // Check if thread was archived - skip to next job
+                if (this.state._threadArchived) {
+                    log.warn('Thread is archived. Moving to next job...');
+                    if (isJob) break;
+                    this.state.running = false;
+                }
+            }
+            else if (this.state._skippedMessages.length > 0) {
+                const oldOffset = this.state.offset;
+                this.state.offset += this.state._skippedMessages.length;
+                log.verb('There\'s nothing we can delete on this page, checking next page...');
+                log.verb(`Skipped ${this.state._skippedMessages.length} out of ${this.state._seachResponse.messages.length} in this page.`, `(Offset was ${oldOffset}, ajusted to ${this.state.offset})`);
+            }
+            else if (this.state.grandTotal > this.state.delCount + this.state.failCount) {
+                // Empty page but grandTotal suggests more messages exist
+                // Discord's search index hasn't caught up yet - retry
+                this.state._indexNotReady = (this.state._indexNotReady || 0) + 1;
+
+                if (this.state._indexNotReady >= 3) {
+                    // Give up after 3 retries
+                    log.warn('Search index not updating after 3 retries. Moving to next job.');
+                    log.verb('[End state]', this.state);
+                    if (isJob) break;
+                    this.state.running = false;
+                } else {
+                    log.warn(`Empty page but ${this.state.grandTotal - this.state.delCount - this.state.failCount} messages should remain. Search index may be slow. Retry ${this.state._indexNotReady}/3...`);
+                }
+            }
+            else {
+                log.verb('Ended because API returned an empty page.');
+                log.verb('[End state]', this.state);
+                if (isJob) break;
+                this.state.running = false;
+            }
 
 	      // wait before next page (fix search page not updating fast enough)
-	      log.verb(`Waiting ${(this.options.searchDelay / 1000).toFixed(2)}s before next page...`);
-	      await wait(this.options.searchDelay);
+            if (this.state._messagesToDelete.length > 0) {
+                log.verb(`Waiting ${(this.options.searchDelay / 1000).toFixed(2)}s before next page...`);
+                await wait(this.options.searchDelay);
+            } else {
+                const shortDelay = 2000; // 2 second minimal delay
+                log.verb(`No messages deleted, using short delay (${shortDelay}ms)...`);
+                await wait(shortDelay);
+            }
 
 	    } while (this.state.running);
 
@@ -644,77 +674,88 @@
 	    }
 	  }
 
-	  async search() {
-	    let API_SEARCH_URL;
-	    if (this.options.guildId === '@me') API_SEARCH_URL = `https://discord.com/api/v9/channels/${this.options.channelId}/messages/`; // DMs
-	    else API_SEARCH_URL = `https://discord.com/api/v9/guilds/${this.options.guildId}/messages/`; // Server
+        async search() {
+            let API_SEARCH_URL;
+            if (this.options.guildId === '@me') API_SEARCH_URL = `https://discord.com/api/v9/channels/${this.options.channelId}/messages/`;
+            else API_SEARCH_URL = `https://discord.com/api/v9/guilds/${this.options.guildId}/messages/`;
 
-	    let resp;
-	    try {
-	      this.beforeRequest();
-	      resp = await fetch(API_SEARCH_URL + 'search?' + queryString([
-	        ['author_id', this.options.authorId || undefined],
-	        ['channel_id', (this.options.guildId !== '@me' ? this.options.channelId : undefined) || undefined],
-	        ['min_id', this.options.minId ? toSnowflake(this.options.minId) : undefined],
-	        ['max_id', this.options.maxId ? toSnowflake(this.options.maxId) : undefined],
-	        ['sort_by', 'timestamp'],
-	        ['sort_order', 'desc'],
-	        ['offset', this.state.offset],
-	        ['has', this.options.hasLink ? 'link' : undefined],
-	        ['has', this.options.hasFile ? 'file' : undefined],
-	        ['content', this.options.content || undefined],
-	        ['include_nsfw', this.options.includeNsfw ? true : undefined],
-	      ]), {
-	        headers: {
-	          'Authorization': this.options.authToken,
-	        }
-	      });
-	      this.afterRequest();
-	    } catch (err) {
-	      this.state.running = false;
-	      log.error('Search request threw an error:', err);
-	      throw err;
-	    }
+            let resp;
+            try {
+                this.beforeRequest();
+                resp = await fetch(API_SEARCH_URL + 'search?' + queryString([
+                    ['author_id', this.options.authorId || undefined],
+                    ['channel_id', (this.options.guildId !== '@me' ? this.options.channelId : undefined) || undefined],
+                    ['min_id', this.options.minId ? toSnowflake(this.options.minId) : undefined],
+                    ['max_id', this.options.maxId ? toSnowflake(this.options.maxId) : undefined],
+                    ['sort_by', 'timestamp'],
+                    ['sort_order', 'desc'],
+                    ['offset', this.state.offset],
+                    ['has', this.options.hasLink ? 'link' : undefined],
+                    ['has', this.options.hasFile ? 'file' : undefined],
+                    ['content', this.options.content || undefined],
+                    ['include_nsfw', this.options.includeNsfw ? true : undefined],
+                ]), {
+                    headers: {
+                        'Authorization': this.options.authToken,
+                    }
+                });
+                this.afterRequest();
+            } catch (err) {
+                log.error('Search request threw an error:', err);
+                log.warn('Skipping this search and continuing...');
+                const errorDelay = 2000; // 2 second delay after errors
+                log.verb(`Waiting ${errorDelay}ms before continuing...`);
+                await wait(errorDelay);
+                this.state.offset++;
+                this.state._seachResponse = { total_results: this.state.grandTotal, messages: [] };
+                return this.state._seachResponse;
+            }
+            // not indexed yet
+            if (resp.status === 202) {
+                let w = (await resp.json()).retry_after * 1000;
+                w = w || this.stats.searchDelay;
+                this.stats.throttledCount++;
+                this.stats.throttledTotalTime += w;
+                log.warn(`This channel isn't indexed yet. Waiting ${w}ms for discord to index it...`);
+                await wait(w);
+                return await this.search();
+            }
 
-	    // not indexed yet
-	    if (resp.status === 202) {
-	      let w = (await resp.json()).retry_after * 1000;
-	      w = w || this.stats.searchDelay; // Fix retry_after 0
-	      this.stats.throttledCount++;
-	      this.stats.throttledTotalTime += w;
-	      log.warn(`This channel isn't indexed yet. Waiting ${w}ms for discord to index it...`);
-	      await wait(w);
-	      return await this.search();
-	    }
+            if (!resp.ok) {
+                // searching messages too fast
+                if (resp.status === 429) {
+                    let jsonResp;
+                    try {
+                        jsonResp = await resp.json();
+                    } catch (e) {
+                        jsonResp = {};
+                    }
+                    let retryAfter = (jsonResp.retry_after && !isNaN(jsonResp.retry_after)) ? jsonResp.retry_after * 1000 : 5000;
+                    this.stats.throttledCount++;
+                    this.stats.throttledTotalTime += retryAfter;
+                    log.warn(`Being rate limited by the API for ${retryAfter}ms!`);
+                    this.printStats();
+                    log.verb(`Cooling down for ${retryAfter}ms before retrying...`);
+                    await wait(retryAfter);
+                    return await this.search();
+                }
+                else {
+                    log.error(`Error searching messages, API responded with status ${resp.status}!`, await resp.json());
+                    log.warn('Skipping this search and continuing...');
+                    const errorDelay = 2000; // 2 second delay after errors
+                    log.verb(`Waiting ${errorDelay}ms before continuing...`);
+                    await wait(errorDelay);
+                    this.state.offset++;
+                    this.state._seachResponse = { total_results: this.state.grandTotal, messages: [] };
+                    return this.state._seachResponse;
+                }
+            }
 
-	    if (!resp.ok) {
-	      // searching messages too fast
-	      if (resp.status === 429) {
-	        let w = (await resp.json()).retry_after * 1000;
-	        w = w || this.stats.searchDelay; // Fix retry_after 0
-
-	        this.stats.throttledCount++;
-	        this.stats.throttledTotalTime += w;
-	        this.stats.searchDelay += w; // increase delay
-	        w = this.stats.searchDelay;
-	        log.warn(`Being rate limited by the API for ${w}ms! Increasing search delay...`);
-	        this.printStats();
-	        log.verb(`Cooling down for ${w * 2}ms before retrying...`);
-
-	        await wait(w * 2);
-	        return await this.search();
-	      }
-	      else {
-	        this.state.running = false;
-	        log.error(`Error searching messages, API responded with status ${resp.status}!\n`, await resp.json());
-	        throw resp;
-	      }
-	    }
-	    const data = await resp.json();
-	    this.state._seachResponse = data;
-	    console.log(PREFIX$1, 'search', data);
-	    return data;
-	  }
+            const data = await resp.json();
+            this.state._seachResponse = data;
+            console.log(PREFIX$1, 'search', data);
+            return data;
+        }
 
 	  async filterResponse() {
 	    const data = this.state._seachResponse;
@@ -748,40 +789,44 @@
 	    console.log(PREFIX$1, 'filterResponse', this.state);
 	  }
 
-	  async deleteMessagesFromList() {
-	    for (let i = 0; i < this.state._messagesToDelete.length; i++) {
-	      const message = this.state._messagesToDelete[i];
-	      if (!this.state.running) return log.error('Stopped by you!');
+        async deleteMessagesFromList() {
+            for (let i = 0; i < this.state._messagesToDelete.length; i++) {
+                const message = this.state._messagesToDelete[i];
+                if (!this.state.running) return log.error('Stopped by you!');
 
-	      log.debug(
-	        // `${((this.state.delCount + 1) / this.state.grandTotal * 100).toFixed(2)}%`,
-	        `[${this.state.delCount + 1}/${this.state.grandTotal}] ` +
-	        `<sup>${new Date(message.timestamp).toLocaleString()}</sup> ` +
-	        `<b>${redact(message.author.username + '#' + message.author.discriminator)}</b>` +
-	        `: <i>${redact(message.content).replace(/\n/g, '↵')}</i>` +
-	        (message.attachments.length ? redact(JSON.stringify(message.attachments)) : ''),
-	        `<sup>{ID:${redact(message.id)}}</sup>`
-	      );
+                log.debug(
+                    `[${this.state.delCount + 1}/${this.state.grandTotal}] ` +
+                    `<sup>${new Date(message.timestamp).toLocaleString()}</sup> ` +
+                    `<b>${redact(message.author.username + '#' + message.author.discriminator)}</b>` +
+                    `: <i>${redact(message.content).replace(/\n/g, '↵')}</i>` +
+                    (message.attachments.length ? redact(JSON.stringify(message.attachments)) : ''),
+                    `<sup>{ID:${redact(message.id)}}</sup>`
+                );
 
-	      // Delete a single message (with retry)
-	      let attempt = 0;
-	      while (attempt < this.options.maxAttempt) {
-	        const result = await this.deleteMessage(message);
+                // Delete a single message (with retry)
+                let attempt = 0;
+                while (attempt < this.options.maxAttempt) {
+                    const result = await this.deleteMessage(message);
 
-	        if (result === 'RETRY') {
-	          attempt++;
-	          log.verb(`Retrying in ${this.options.deleteDelay}ms... (${attempt}/${this.options.maxAttempt})`);
-	          await wait(this.options.deleteDelay);
-	        }
-	        else break;
-	      }
+                    if (result === 'ARCHIVED') {
+                        this.state._threadArchived = true;
+                        return; // Exit immediately
+                    }
 
-	      this.calcEtr();
-	      if (this.onProgress) this.onProgress(this.state, this.stats);
+                    if (result === 'RETRY') {
+                        attempt++;
+                        log.verb(`Retrying in ${this.options.deleteDelay}ms... (${attempt}/${this.options.maxAttempt})`);
+                        await wait(this.options.deleteDelay);
+                    }
+                    else break;
+                }
 
-	      await wait(this.options.deleteDelay);
-	    }
-	  }
+                this.calcEtr();
+                if (this.onProgress) this.onProgress(this.state, this.stats);
+
+                await wait(this.options.deleteDelay);
+            }
+        }
 
 	  async deleteMessage(message) {
 	    const API_DELETE_URL = `https://discord.com/api/v9/channels/${message.channel_id}/messages/${message.id}`;
@@ -804,32 +849,33 @@
 	    }
 
 	    if (!resp.ok) {
-	      if (resp.status === 429) {
-	        // deleting messages too fast
-	        const w = (await resp.json()).retry_after * 1000;
-	        this.stats.throttledCount++;
-	        this.stats.throttledTotalTime += w;
-	        this.options.deleteDelay = w; // increase delay
-	        log.warn(`Being rate limited by the API for ${w}ms! Adjusted delete delay to ${this.options.deleteDelay}ms.`);
-	        this.printStats();
-	        log.verb(`Cooling down for ${w * 2}ms before retrying...`);
-	        await wait(w * 2);
-	        return 'RETRY';
-	      } else {
+            if (resp.status === 429) {
+                let jsonResp;
+                try {
+                    jsonResp = await resp.json();
+                } catch (e) {
+                    jsonResp = {};
+                }
+                let w = (jsonResp.retry_after && !isNaN(jsonResp.retry_after)) ? jsonResp.retry_after * 1000 : this.options.searchDelay;
+                this.stats.throttledCount++;
+                this.stats.throttledTotalTime += w;
+                this.stats.searchDelay += w; // increase delay
+                w = this.stats.searchDelay;
+                log.warn(`Being rate limited by the API for ${w}ms! Increasing search delay...`);
+                this.printStats();
+                log.verb(`Cooling down for ${w * 2}ms before retrying...`);
+                await wait(w * 2);
+                return await this.search();
+            } else {
 	        const body = await resp.text();
 
 	        try {
 	          const r = JSON.parse(body);
 
-	          if (resp.status === 400 && r.code === 50083) {
-	            // 400 can happen if the thread is archived (code=50083)
-	            // in this case we need to "skip" this message from the next search
-	            // otherwise it will come up again in the next page (and fail to delete again)
-	            log.warn('Error deleting message (Thread is archived). Will increment offset so we don\'t search this in the next page...');
-	            this.state.offset++;
-	            this.state.failCount++;
-	            return 'FAIL_SKIP'; // Failed but we will skip it next time
-	          }
+                if (resp.status === 400 && r.code === 50083) {
+                    log.warn('Thread is archived - cannot delete messages. Skipping this channel...');
+                    return 'ARCHIVED';
+                }
 
 	          log.error(`Error deleting message, API responded with status ${resp.status}!`, r);
 	          log.verb('Related object:', redact(JSON.stringify(message)));
@@ -1345,34 +1391,107 @@ body.undiscord-pick-message.after [id^="message-content-"]:hover::after {
 	    $('div#deleteDelayValue').textContent = event.target.value + 'ms';
 	  });
 
-	  // import json
-	  const fileSelection = $('input#importJsonInput');
-	  fileSelection.onchange = async () => {
-	    const files = fileSelection.files;
+        // import json
+        const fileSelection = $('input#importJsonInput');
+        fileSelection.onchange = async () => {
+            const files = fileSelection.files;
+            if (files.length === 0) return log.warn('No file selected.');
 
-	    // No files added
-	    if (files.length === 0) return log.warn('No file selected.');
+            // Need token to look up channel info
+            const authToken = $('input#token').value.trim() || fillToken();
+            if (!authToken) {
+                return log.error('Token required to look up channel guilds. Please fill the token first.');
+            }
 
-	    // Get channel id field to set it later
-	    const channelIdField = $('input#channelId');
+            // Set author id in case its not set already
+            $('input#authorId').value = getAuthorId();
 
-	    // Force the guild id to be ourself (@me)
-	    const guildIdField = $('input#guildId');
-	    guildIdField.value = '@me';
+            try {
+                const file = files[0];
+                const text = await file.text();
+                const json = JSON.parse(text);
+                const entries = Object.entries(json);
 
-	    // Set author id in case its not set already
-	    $('input#authorId').value = getAuthorId();
-	    try {
-	      const file = files[0];
-	      const text = await file.text();
-	      const json = JSON.parse(text);
-	      const channelIds = Object.keys(json);
-	      channelIdField.value = channelIds.join(',');
-	      log.info(`Loaded ${channelIds.length} channels.`);
-	    } catch(err) {
-	      log.error('Error parsing file!', err);
-	    }
-	  };
+                log.info(`Processing ${entries.length} channels from archive...`);
+
+                const jobs = [];
+                let skipped = 0;
+                let dmCount = 0;
+                let serverCount = 0;
+                let lookupFailed = 0;
+
+                for (let i = 0; i < entries.length; i++) {
+                    const [channelId, description] = entries[i];
+
+                    // Skip unknown/inaccessible channels
+                    if (description === 'Unknown channel' || description === 'None' || description.startsWith('Unknown channel in')) {
+                        log.verb(`Skipping inaccessible: ${channelId} (${description})`);
+                        skipped++;
+                        continue;
+                    }
+
+                    // Check if it's a DM (Direct Message or Group DM without " in ")
+                    if (description.startsWith('Direct Message with') || !description.includes(' in ')) {
+                        jobs.push({ guildId: '@me', channelId });
+                        dmCount++;
+                    } else {
+                        // It's a server channel - need to look up the guild ID
+                        try {
+                            const resp = await fetch(`https://discord.com/api/v9/channels/${channelId}`, {
+                                headers: { 'Authorization': authToken }
+                            });
+
+                            if (resp.status === 429) {
+                                const rateLimitData = await resp.json();
+                                const waitTime = (rateLimitData.retry_after || 1) * 1000;
+                                log.warn(`Rate limited, waiting ${waitTime}ms...`);
+                                await wait(waitTime);
+                                i--; // Retry this channel
+                                continue;
+                            }
+
+                            if (resp.ok) {
+                                const channelData = await resp.json();
+                                if (channelData.guild_id) {
+                                    jobs.push({ guildId: channelData.guild_id, channelId });
+                                    serverCount++;
+                                } else {
+                                    // No guild_id means it's a DM/group DM
+                                    jobs.push({ guildId: '@me', channelId });
+                                    dmCount++;
+                                }
+                            } else {
+                                log.verb(`Could not look up channel ${channelId}: ${resp.status} - treating as DM`);
+                                // Channel might be deleted or inaccessible, try as DM anyway
+                                jobs.push({ guildId: '@me', channelId });
+                                lookupFailed++;
+                            }
+
+                            // Small delay to avoid rate limiting (50ms between lookups)
+                            await wait(50);
+                        } catch (err) {
+                            log.warn(`Error looking up channel ${channelId}:`, err);
+                            lookupFailed++;
+                        }
+                    }
+
+                    // Progress update every 50 channels
+                    if (i % 50 === 0 && i > 0) {
+                        log.info(`Progress: ${i}/${entries.length} channels processed...`);
+                    }
+                }
+
+                // Store jobs for use when Start is clicked
+                window.undiscordArchiveJobs = jobs;
+
+                log.info(`Archive processed: ${jobs.length} jobs created`);
+                log.info(`  DMs: ${dmCount}, Server channels: ${serverCount}, Lookup failed: ${lookupFailed}, Skipped: ${skipped}`);
+                log.success('Click "Delete" to start processing the archive.');
+
+            } catch(err) {
+                log.error('Error parsing file!', err);
+            }
+        };
 
 	  // redirect console logs to inside the window after setting up the UI
 	  setLogFn(printLog);
@@ -1443,80 +1562,111 @@ body.undiscord-pick-message.after [id^="message-content-"]:hover::after {
 	  };
 	}
 
-	async function startAction() {
-	  console.log(PREFIX, 'startAction');
-	  // general
-	  const authorId = $('input#authorId').value.trim();
-	  const guildId = $('input#guildId').value.trim();
-	  const channelIds = $('input#channelId').value.trim().split(/\s*,\s*/);
-	  const includeNsfw = $('input#includeNsfw').checked;
-	  // filter
-	  const content = $('input#search').value.trim();
-	  const hasLink = $('input#hasLink').checked;
-	  const hasFile = $('input#hasFile').checked;
-	  const includePinned = $('input#includePinned').checked;
-	  const pattern = $('input#pattern').value;
-	  // message interval
-	  const minId = $('input#minId').value.trim();
-	  const maxId = $('input#maxId').value.trim();
-	  // date range
-	  const minDate = $('input#minDate').value.trim();
-	  const maxDate = $('input#maxDate').value.trim();
-	  //advanced
-	  const searchDelay = parseInt($('input#searchDelay').value.trim());
-	  const deleteDelay = parseInt($('input#deleteDelay').value.trim());
-	 
-	  // token
-	  const authToken = $('input#token').value.trim() || fillToken();
-	  if (!authToken) return; // get token already logs an error.
-	  
-	  // validate input
-	  if (!guildId) return log.error('You must fill the "Server ID" field!');
-	 
-	  // clear logArea
-	  ui.logArea.innerHTML = '';
+    async function startAction() {
+        console.log(PREFIX, 'startAction');
+        // general
+        const authorId = $('input#authorId').value.trim();
+        const guildId = $('input#guildId').value.trim();
+        const channelIds = $('input#channelId').value.trim().split(/\s*,\s*/);
+        const includeNsfw = $('input#includeNsfw').checked;
+        // filter
+        const content = $('input#search').value.trim();
+        const hasLink = $('input#hasLink').checked;
+        const hasFile = $('input#hasFile').checked;
+        const includePinned = $('input#includePinned').checked;
+        const pattern = $('input#pattern').value;
+        // message interval
+        const minId = $('input#minId').value.trim();
+        const maxId = $('input#maxId').value.trim();
+        // date range
+        const minDate = $('input#minDate').value.trim();
+        const maxDate = $('input#maxDate').value.trim();
+        //advanced
+        const searchDelay = parseInt($('input#searchDelay').value.trim());
+        const deleteDelay = parseInt($('input#deleteDelay').value.trim());
 
-	  undiscordCore.resetState();
-	  undiscordCore.options = {
-	    ...undiscordCore.options,
-	    authToken,
-	    authorId,
-	    guildId,
-	    channelId: channelIds.length === 1 ? channelIds[0] : undefined, // single or multiple channel
-	    minId: minId || minDate,
-	    maxId: maxId || maxDate,
-	    content,
-	    hasLink,
-	    hasFile,
-	    includeNsfw,
-	    includePinned,
-	    pattern,
-	    searchDelay,
-	    deleteDelay,
-	    // maxAttempt: 2,
-	  };
-	  if (channelIds.length > 1) {
-	    const jobs = channelIds.map(ch => ({
-	      guildId: guildId,
-	      channelId: ch,
-	    }));
+        // token
+        const authToken = $('input#token').value.trim() || fillToken();
+        if (!authToken) return; // get token already logs an error.
 
-	    try {
-	      await undiscordCore.runBatch(jobs);
-	    } catch (err) {
-	      log.error('CoreException', err);
-	    }
-	  }
-	  // single channel
-	  else {
-	    try {
-	      await undiscordCore.run();
-	    } catch (err) {
-	      log.error('CoreException', err);
-	      undiscordCore.stop();
-	    }
-	  }
-	}
+        // clear logArea
+        ui.logArea.innerHTML = '';
+
+        // Check if we have archive jobs to process
+        if (window.undiscordArchiveJobs && window.undiscordArchiveJobs.length > 0) {
+            log.info(`Using ${window.undiscordArchiveJobs.length} jobs from imported archive`);
+
+            undiscordCore.resetState();
+            undiscordCore.options = {
+                ...undiscordCore.options,
+                authToken,
+                authorId,
+                minId: minId || minDate,
+                maxId: maxId || maxDate,
+                content,
+                hasLink,
+                hasFile,
+                includeNsfw,
+                includePinned,
+                pattern,
+                searchDelay,
+                deleteDelay,
+            };
+
+            try {
+                await undiscordCore.runBatch(window.undiscordArchiveJobs);
+            } catch (err) {
+                log.error('CoreException', err);
+            }
+
+            // Clear the jobs after use
+            window.undiscordArchiveJobs = null;
+            return;
+        }
+
+        // Manual mode - validate input
+        if (!guildId) return log.error('You must fill the "Server ID" field!');
+
+        undiscordCore.resetState();
+        undiscordCore.options = {
+            ...undiscordCore.options,
+            authToken,
+            authorId,
+            guildId,
+            channelId: channelIds.length === 1 ? channelIds[0] : undefined,
+            minId: minId || minDate,
+            maxId: maxId || maxDate,
+            content,
+            hasLink,
+            hasFile,
+            includeNsfw,
+            includePinned,
+            pattern,
+            searchDelay,
+            deleteDelay,
+        };
+
+        if (channelIds.length > 1) {
+            const jobs = channelIds.map(ch => ({
+                guildId: guildId,
+                channelId: ch,
+            }));
+
+            try {
+                await undiscordCore.runBatch(jobs);
+            } catch (err) {
+                log.error('CoreException', err);
+            }
+        }
+        else {
+            try {
+                await undiscordCore.run();
+            } catch (err) {
+                log.error('CoreException', err);
+                undiscordCore.stop();
+            }
+        }
+    }
 
 	function stopAction() {
 	  console.log(PREFIX, 'stopAction');
