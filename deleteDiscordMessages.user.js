@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            Undiscord
 // @description     Delete all messages in a Discord channel or DM (Bulk deletion)
-// @version         5.2.4b
+// @version         5.2.4c
 // @author          victornpb
 // @homepageURL     https://github.com/victornpb/undiscord
 // @supportURL      https://github.com/victornpb/undiscord/discussions
@@ -492,14 +492,16 @@
                 iterations: 0,
                 _indexNotReady: 0,
                 _threadArchived: false,
+                skippedCount: 0,
 
                 _seachResponse: null,
                 _messagesToDelete: [],
                 _skippedMessages: [],
             };
 
-	    this.options.askForConfirmation = true;
-	  }
+            this.options.askForConfirmation = true;
+        }
+
 
 	  /** Automate the deletion process of multiple channels */
 	  async runBatch(queue) {
@@ -523,7 +525,7 @@
 	      this.resetState();
 	      this.options.askForConfirmation = false;
 	      this.state.running = true; // continue running
-          const jobDelay = 3000; // 1 second between jobs
+          const jobDelay = 3000
           log.verb(`Waiting ${jobDelay}ms before next job...`);
           await wait(jobDelay);
 	    }
@@ -597,19 +599,18 @@
                 log.verb('There\'s nothing we can delete on this page, checking next page...');
                 log.verb(`Skipped ${this.state._skippedMessages.length} out of ${this.state._seachResponse.messages.length} in this page.`, `(Offset was ${oldOffset}, ajusted to ${this.state.offset})`);
             }
-            else if (this.state.grandTotal > this.state.delCount + this.state.failCount) {
-                // Empty page but grandTotal suggests more messages exist
-                // Discord's search index hasn't caught up yet - retry
+            else if (this.state.grandTotal > this.state.delCount + this.state.failCount + this.state.skippedCount) {
                 this.state._indexNotReady = (this.state._indexNotReady || 0) + 1;
 
                 if (this.state._indexNotReady >= 3) {
-                    // Give up after 3 retries
                     log.warn('Search index not updating after 3 retries. Moving to next job.');
                     log.verb('[End state]', this.state);
                     if (isJob) break;
                     this.state.running = false;
                 } else {
-                    log.warn(`Empty page but ${this.state.grandTotal - this.state.delCount - this.state.failCount} messages should remain. Search index may be slow. Retry ${this.state._indexNotReady}/3...`);
+                    const remaining = this.state.grandTotal - this.state.delCount - this.state.failCount - this.state.skippedCount;
+                    log.warn(`Empty page but ${remaining} messages should remain. Waiting for search index to update... Retry ${this.state._indexNotReady}/3`);
+                    await wait(this.options.searchDelay);
                 }
             }
             else {
@@ -757,37 +758,47 @@
             return data;
         }
 
-	  async filterResponse() {
-	    const data = this.state._seachResponse;
+        async filterResponse() {
+            const data = this.state._seachResponse;
 
-	    // the search total will decrease as we delete stuff
-	    const total = data.total_results;
-	    if (total > this.state.grandTotal) this.state.grandTotal = total;
+            // the search total will decrease as we delete stuff
+            const total = data.total_results;
+            if (total > this.state.grandTotal) this.state.grandTotal = total;
 
-	    // search returns messages near the the actual message, only get the messages we searched for.
-	    const discoveredMessages = data.messages.map(convo => convo.find(message => message.hit === true));
+            // search returns messages near the the actual message, only get the messages we searched for.
+            const discoveredMessages = data.messages.map(convo => convo.find(message => message.hit === true));
 
-	    // we can only delete some types of messages, system messages are not deletable.
-	    let messagesToDelete = discoveredMessages;
-	    messagesToDelete = messagesToDelete.filter(msg => msg.type === 0 || (msg.type >= 6 && msg.type <= 21));
-	    messagesToDelete = messagesToDelete.filter(msg => msg.pinned ? this.options.includePinned : true);
+            // we can only delete some types of messages, system messages are not deletable.
+            let messagesToDelete = discoveredMessages;
 
-	    // custom filter of messages
-	    try {
-	      const regex = new RegExp(this.options.pattern, 'i');
-	      messagesToDelete = messagesToDelete.filter(msg => regex.test(msg.content));
-	    } catch (e) {
-	      log.warn('Ignoring RegExp because pattern is malformed!', e);
-	    }
+            // Filter by message type and count system messages
+            const deletableTypes = messagesToDelete.filter(msg => msg.type === 0 || (msg.type >= 6 && msg.type <= 21));
+            const systemMessages = messagesToDelete.filter(msg => !(msg.type === 0 || (msg.type >= 6 && msg.type <= 21)));
 
-	    // create an array containing everything we skipped. (used to calculate offset for next searches)
-	    const skippedMessages = discoveredMessages.filter(msg => !messagesToDelete.find(m => m.id === msg.id));
+            if (systemMessages.length > 0) {
+                log.verb(`Found ${systemMessages.length} system message(s) that cannot be deleted (will be skipped).`);
+                this.state.skippedCount += systemMessages.length;
+            }
 
-	    this.state._messagesToDelete = messagesToDelete;
-	    this.state._skippedMessages = skippedMessages;
+            messagesToDelete = deletableTypes;
+            messagesToDelete = messagesToDelete.filter(msg => msg.pinned ? this.options.includePinned : true);
 
-	    console.log(PREFIX$1, 'filterResponse', this.state);
-	  }
+            // custom filter of messages
+            try {
+                const regex = new RegExp(this.options.pattern, 'i');
+                messagesToDelete = messagesToDelete.filter(msg => regex.test(msg.content));
+            } catch (e) {
+                log.warn('Ignoring RegExp because pattern is malformed!', e);
+            }
+
+            // create an array containing everything we skipped. (used to calculate offset for next searches)
+            const skippedMessages = discoveredMessages.filter(msg => !messagesToDelete.find(m => m.id === msg.id));
+
+            this.state._messagesToDelete = messagesToDelete;
+            this.state._skippedMessages = skippedMessages;
+
+            console.log(PREFIX$1, 'filterResponse', this.state);
+        }
 
         async deleteMessagesFromList() {
             for (let i = 0; i < this.state._messagesToDelete.length; i++) {
